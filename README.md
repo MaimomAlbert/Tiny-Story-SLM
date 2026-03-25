@@ -1,0 +1,372 @@
+# 🧠 Small Language Model (SLM) — Built from Scratch
+
+> A GPT-style autoregressive language model trained from scratch on the TinyStories dataset using pure PyTorch — no pretrained weights, no fine-tuning shortcuts.
+
+---
+
+## 📖 Table of Contents
+
+- [Overview](#overview)
+- [Model Architecture](#model-architecture)
+- [Dataset](#dataset)
+- [Tokenization](#tokenization)
+- [Training](#training)
+- [Results](#results)
+- [How to Generate Text](#how-to-generate-text)
+- [File Structure](#file-structure)
+- [Tech Stack](#tech-stack)
+- [References](#references)
+
+---
+
+## Overview
+
+This project implements a **Small Language Model (SLM)** entirely from scratch using PyTorch. Inspired by the GPT (Generative Pretrained Transformer) architecture, the model learns to predict the next token in a sequence — and through doing this billions of times across millions of short stories, it learns grammar, narrative structure, and basic world knowledge.
+
+The goal was to understand transformer-based language models deeply by building every component manually: the tokenizer pipeline, the attention mechanism, the transformer blocks, the training loop with gradient accumulation, mixed-precision training, and autoregressive text generation.
+
+---
+
+## Model Architecture
+
+This is a **decoder-only transformer** — the same family as GPT-2, GPT-3, and LLaMA. It has no encoder and no cross-attention; it only attends to past tokens (causal attention).
+
+### Architecture Diagram
+
+```
+Input Tokens (token IDs)
+        │
+        ▼
+┌───────────────────┐
+│  Token Embedding  │  (vocab_size → n_embd)
+│ + Pos. Embedding  │  (block_size → n_embd)
+└───────────────────┘
+        │   Dropout
+        ▼
+┌───────────────────┐
+│  Transformer      │  ×6 blocks
+│  Block            │
+│  ┌─────────────┐  │
+│  │  LayerNorm  │  │
+│  │  ↓          │  │
+│  │  Causal     │  │
+│  │  Self-Attn  │  │  (6 heads, 64 dim/head)
+│  │  ↓          │  │
+│  │  Residual + │  │
+│  ├─────────────┤  │
+│  │  LayerNorm  │  │
+│  │  ↓          │  │
+│  │  MLP        │  │  (384 → 1536 → 384)
+│  │  (GELU)     │  │
+│  │  ↓          │  │
+│  │  Residual + │  │
+│  └─────────────┘  │
+└───────────────────┘
+        │
+        ▼
+┌───────────────────┐
+│   Final LayerNorm │
+└───────────────────┘
+        │
+        ▼
+┌───────────────────┐
+│   LM Head (Linear)│  (n_embd → vocab_size)
+└───────────────────┘
+        │
+        ▼
+  Logits → Softmax → Next Token Probability
+```
+
+### Configuration
+
+| Hyperparameter      | Value     | Explanation                                        |
+|---------------------|-----------|----------------------------------------------------|
+| `vocab_size`        | 50,257    | GPT-2 BPE vocabulary                              |
+| `block_size`        | 128       | Context window — tokens the model sees at once     |
+| `n_layer`           | 6         | Number of stacked transformer blocks              |
+| `n_head`            | 6         | Number of parallel attention heads                |
+| `n_embd`            | 384       | Embedding dimension per token                     |
+| `dropout`           | 0.1       | Regularization — drops 10% of activations         |
+| `bias`              | True      | Uses bias terms in linear layers                  |
+| **Total parameters**| **~25M**  |                                                    |
+
+### Key Components
+
+#### 1. Causal Self-Attention
+Each token attends to all previous tokens (and itself) but never future ones. This is enforced by a **causal mask** — a lower triangular matrix of ones that blocks future positions.
+
+For each attention head, the model computes:
+
+```
+Attention(Q, K, V) = softmax(QKᵀ / √d_k) × V
+```
+
+The model uses **Flash Attention** (`F.scaled_dot_product_attention`) when available, which is significantly faster and more memory-efficient than the manual implementation.
+
+#### 2. Layer Normalization
+Applied **before** each sub-block (pre-norm style), not after. Pre-norm is more stable during training of deep networks. Each norm has learnable scale (`γ`) and shift (`β`) parameters.
+
+#### 3. MLP (Feed-Forward Network)
+A 2-layer MLP with a 4× hidden expansion:
+```
+x → Linear(384, 1536) → GELU → Linear(1536, 384) → Dropout
+```
+GELU is used over ReLU because its smooth curve helps with gradient flow.
+
+#### 4. Residual Connections
+Every sub-block uses skip connections:
+```python
+x = x + self.attn(self.ln1(x))
+x = x + self.mlp(self.ln2(x))
+```
+These allow gradients to flow directly through the network, preventing vanishing gradients in deep stacks.
+
+#### 5. Weight Tying
+The token embedding matrix (`wte`) is shared with the output language model head (`lm_head`). This reduces parameters and improves performance — tokens that are semantically close get similar representations in both spaces.
+
+---
+
+## Dataset
+
+**Dataset:** [`roneneldan/TinyStories`](https://huggingface.co/datasets/roneneldan/TinyStories)
+
+A dataset of short children's stories generated by GPT-3.5/4, designed specifically for training small language models.
+
+| Split      | Stories     | Description                              |
+|------------|-------------|------------------------------------------|
+| Train      | 2,119,719   | ~2.1 million short stories               |
+| Validation | 21,990      | ~22K stories for evaluation              |
+
+Each story is a few paragraphs long, written in simple English with basic vocabulary — making it ideal for a small model to learn narrative structure and coherent text generation.
+
+---
+
+## Tokenization
+
+The model uses **OpenAI's `tiktoken` library** with the **GPT-2 BPE (Byte Pair Encoding)** tokenizer.
+
+### Why BPE?
+BPE is a **subword tokenizer** — it splits rare words into smaller pieces while keeping common words as single tokens. For example:
+
+```
+"unbelievable" → ["un", "believ", "able"]
+"cat"          → ["cat"]
+```
+
+This gives the best of both worlds:
+- Handles unseen/rare words (unlike word-level tokenization)
+- More efficient than character-level (fewer tokens per sequence)
+- Fixed, known vocabulary size (50,257 tokens)
+
+### Data Pipeline
+
+```
+Raw text stories
+      │
+      ▼ tiktoken BPE encode
+List of token IDs per story
+      │
+      ▼ Concatenate all token IDs
+Single flat array of ~500M integers
+      │
+      ▼ np.memmap (uint16, on disk)
+train.bin / validation.bin
+      │
+      ▼ Random sampling at training time
+Input (X) and Target (Y) batches
+```
+
+Token IDs are stored as `uint16` (2 bytes each), since the vocabulary size (50,257) fits within the 65,535 maximum of a 16-bit unsigned integer. This saves ~50% storage vs `int32`.
+
+**Memory-mapped files (`np.memmap`)** are used so the full dataset never loads into RAM — the OS handles paging data in as needed.
+
+---
+
+## Training
+
+### Hyperparameters
+
+| Parameter                    | Value   | Reason                                         |
+|------------------------------|---------|------------------------------------------------|
+| `learning_rate`              | 1e-4    | Stable starting LR for AdamW                  |
+| `max_iters`                  | 10,000  | ~2 hours on T4 GPU                            |
+| `batch_size`                 | 32      | Sequences per forward pass                    |
+| `gradient_accumulation_steps`| 32      | Effective batch = 32 × 32 = 1,024             |
+| `block_size`                 | 128     | Tokens per sequence                           |
+| `warmup_steps`               | 1,000   | Linear LR warmup steps                        |
+| `eval_iters`                 | 500     | Evaluate every 500 steps                      |
+| `weight_decay`               | 0.1     | L2 regularization via AdamW                   |
+| `grad_clip`                  | 0.5     | Max gradient norm                             |
+
+### Optimizer
+**AdamW** with β₁=0.9, β₂=0.95, ε=1e-9. The higher β₂ (vs default 0.999) is common for language model training — it makes the optimizer react faster to recent gradient magnitudes.
+
+### Learning Rate Schedule
+
+```
+LR
+ │
+ │         ╱‾‾‾‾‾‾╲___________
+ │        ╱                    ╲___
+ │       ╱                         ╲___
+ │──────╱                               ╲______
+ │  Warmup    Cosine Decay
+ └─────────────────────────────────────────── Steps
+      1000              10000
+```
+
+Linear warmup for 1,000 steps prevents large unstable updates at the start when weights are random. Cosine annealing then smoothly decays the LR to `min_lr = 5e-4`.
+
+### Mixed Precision Training (AMP)
+Uses `torch.amp.autocast` with `bfloat16` (on supported GPUs) or `float16`:
+- **Matrix multiplications** → FP16 (fast, low memory)
+- **Softmax, loss** → FP32 (prevents numerical overflow)
+- **GradScaler** scales gradients to avoid FP16 underflow during backprop
+
+### Gradient Accumulation
+Instead of updating weights every step, gradients are accumulated for 32 steps:
+```python
+loss = loss / gradient_accumulation_steps
+loss.backward()
+# ... every 32 steps:
+optimizer.step()
+optimizer.zero_grad()
+```
+This simulates training with a batch size of **1,024** while only holding 32 sequences in GPU memory at a time.
+
+### Checkpointing
+The best model (lowest validation loss) is saved automatically:
+```python
+torch.save(model.state_dict(), "best_model_params.pt")
+```
+
+---
+
+## Results
+
+Training on T4 GPU for ~2 hours (10,000 steps):
+
+| Step  | Train Loss | Val Loss |
+|-------|------------|----------|
+| 500   | 9.39       | 9.39     |
+| 1000  | 8.44       | 8.44     |
+| 2000  | 6.60       | 6.60     |
+| 3000  | 5.30       | 5.30     |
+| 5000  | 4.00       | 4.01     |
+| 7000  | 3.41       | 3.41     |
+| 9500  | 2.96       | 2.97     |
+
+Both curves track closely — no significant overfitting. Continued training would push loss lower and improve output quality.
+
+### Sample Generated Text
+
+**Prompt:** `"Once upon a time there was a girl."`
+
+```
+Once upon a time there was a girl. It was very much. She wanted to touch it to Ben.
+
+One flames carefully holding all hill. They were in the volcano and all forgot about the
+stars. But they said to go.
+
+The next to their house got grumpy and pulled their crown on the ground...
+```
+
+**Prompt:** `"A little girl went to the woods"`
+
+```
+A little girl went to the woods, around the woods she saw a big surprise entrance.
+The piano stopped by the sky and the l poured it off to meet a special way to finish.
+When Mom of infected she stepped! Then she found into her trunk to open it...
+```
+
+The model has learned basic English grammar, story structure, character names, and dialogue — impressive for ~25M parameters trained for 2 hours!
+
+---
+
+## How to Generate Text
+
+```python
+import torch
+import tiktoken
+
+# Load tokenizer
+encoding = tiktoken.get_encoding("gpt2")
+
+# Load model
+model = GPT(config)
+model.load_state_dict(torch.load("best_model_params.pt", map_location="cpu"))
+model.eval()
+
+# Generate
+sentence = "Once upon a time"
+context = torch.tensor(encoding.encode_ordinary(sentence)).unsqueeze(0)
+
+with torch.no_grad():
+    output = model.generate(
+        context,
+        max_new_tokens=200,
+        temperature=0.8,   # higher = more creative, lower = more deterministic
+        top_k=40           # only sample from top 40 most likely next tokens
+    )
+
+print(encoding.decode(output.squeeze().tolist()))
+```
+
+### Generation Parameters
+
+| Parameter     | Effect                                                              |
+|---------------|---------------------------------------------------------------------|
+| `temperature` | > 1.0 = more random/creative; < 1.0 = more focused/repetitive     |
+| `top_k`       | Limits sampling to top-k tokens; lower = safer but less varied     |
+| `max_new_tokens` | How many new tokens to generate after the prompt                |
+
+---
+
+## File Structure
+
+```
+📁 project/
+├── 📓 Small_Language_Model_Building.ipynb   # Main training notebook
+├── 📄 README.md                             # This file
+├── 💾 train.bin                             # Tokenized training data (~400MB)
+├── 💾 validation.bin                        # Tokenized validation data (~4MB)
+└── 🏆 best_model_params.pt                 # Best model checkpoint weights
+```
+
+---
+
+## Tech Stack
+
+| Library        | Version  | Purpose                                      |
+|----------------|----------|----------------------------------------------|
+| `torch`        | 2.6.0    | Core deep learning framework                 |
+| `datasets`     | 3.6.0    | Loading TinyStories from HuggingFace Hub     |
+| `tiktoken`     | 0.9.0    | Fast BPE tokenization (OpenAI)               |
+| `numpy`        | 2.0.2    | Memory-mapped data arrays                   |
+| `tqdm`         | 4.67.1   | Training progress bars                       |
+| `matplotlib`   | 3.x      | Loss curve plotting                          |
+
+**Hardware:** Google Colab T4 GPU (15GB VRAM)
+**Training time:** ~2 hours for 10,000 iterations
+
+---
+
+## References
+
+- [Attention Is All You Need](https://arxiv.org/abs/1706.03762) — Vaswani et al. (2017) — Original transformer paper
+- [Language Models are Unsupervised Multitask Learners](https://cdn.openai.com/better-language-models/language_models_are_unsupervised_multitask_learners.pdf) — GPT-2 paper (Radford et al., 2019)
+- [TinyStories Dataset](https://arxiv.org/abs/2305.07759) — Eldan & Li (2023)
+- [nanoGPT](https://github.com/karpathy/nanoGPT) — Andrej Karpathy — Architecture reference
+- [Transformers Without Normalization](https://medium.com/@kakadechaitanya77/what-exactly-is-transformers-without-normalization-dyt-part-1-3cdeae976c00) — Author's blog post on LayerNorm alternatives
+
+---
+
+## Author
+
+Built as a learning project to understand transformer-based language models from the ground up — every layer, every gradient, every design decision.
+
+> *"The best way to understand how something works is to build it yourself."*
+
+---
+
+⭐ If you found this helpful, consider giving it a star!
